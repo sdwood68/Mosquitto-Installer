@@ -1,0 +1,30 @@
+# Secrets / env
+mosquitto.env
+*.env
+!.env.example
+
+# TLS / keys / certs
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+tls/
+certs/
+
+# Logs / runtime
+*.log
+logs/
+var/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Shell artifacts
+*.bak
+*.tmp
