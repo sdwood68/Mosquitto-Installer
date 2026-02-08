@@ -66,9 +66,10 @@ install -d -m 0755 "$MOSQ_PERSISTENCE_LOCATION"
 
 chown -R mosquitto:mosquitto "$MOSQ_PERSISTENCE_LOCATION"
 
-echo "[3/11] Ensuring password file exists..."
+echo "[3/11] Ensuring password file exists (root-owned)..."
+# Keep passwd root-owned to match stricter future Mosquitto behavior.
 install -m 0640 /dev/null "$MOSQ_PASSWORD_FILE"
-chown mosquitto:mosquitto "$MOSQ_PASSWORD_FILE"
+chown root:root "$MOSQ_PASSWORD_FILE"
 chmod 0640 "$MOSQ_PASSWORD_FILE"
 
 create_user() {
@@ -90,7 +91,7 @@ create_user() {
   fi
 
   mosquitto_passwd -b "$MOSQ_PASSWORD_FILE" "$user" "$pass"
-  chown mosquitto:mosquitto "$MOSQ_PASSWORD_FILE"
+  chown root:root "$MOSQ_PASSWORD_FILE"
   chmod 0640 "$MOSQ_PASSWORD_FILE"
 }
 
@@ -106,7 +107,7 @@ echo "[4/11] Firewall (UFW)..."
 if [[ "$UFW_ALLOW" == "true" ]]; then
   ufw allow OpenSSH >/dev/null || true
 
-  # Needed for Let's Encrypt HTTP-01 challenge issuance/renewal when using --standalone
+  # Needed for Let's Encrypt HTTP-01 standalone validation
   if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
     ufw allow 80/tcp >/dev/null || true
   fi
@@ -149,7 +150,7 @@ chmod 0755 "$HOOK_PATH"
 echo "[7/11] (Optional) Ensuring ACL file exists..."
 if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
   install -m 0640 /dev/null "$MOSQ_ACL_FILE"
-  chown mosquitto:mosquitto "$MOSQ_ACL_FILE"
+  chown root:root "$MOSQ_ACL_FILE"
   chmod 0640 "$MOSQ_ACL_FILE"
 fi
 
@@ -163,6 +164,18 @@ user mosquitto
 include_dir $MOSQ_CONF_DIR
 EOF
 
+# Build logging safely: 'log_dest file' requires the path on the same line.
+LOG_LINES=""
+if [[ "$MOSQ_LOG_DEST" == "file" ]]; then
+  if [[ -z "$MOSQ_LOG_FILE" ]]; then
+    echo "MOSQ_LOG_DEST=file requires MOSQ_LOG_FILE to be set."
+    exit 1
+  fi
+  LOG_LINES=$'log_dest file '"$MOSQ_LOG_FILE"$'\n'
+else
+  LOG_LINES=$'log_dest '"$MOSQ_LOG_DEST"$'\n'
+fi
+
 cat > "$CONF_SNIPPET" <<EOF
 # Managed by install_mosquitto_vps.sh
 
@@ -175,9 +188,7 @@ persistence ${MOSQ_PERSISTENCE}
 persistence_location ${MOSQ_PERSISTENCE_LOCATION}
 
 # --- Logging ---
-log_dest ${MOSQ_LOG_DEST}
-log_dest file ${MOSQ_LOG_FILE}
-log_type error
+${LOG_LINES}log_type error
 log_type warning
 log_type notice
 connection_messages true

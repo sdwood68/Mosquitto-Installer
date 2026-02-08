@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ENV_FILE="${1:-./mosquitto.env}"
-PURGE_PACKAGES="${2:-false}"   # set true to apt-get purge
+PURGE_PACKAGES="${2:-false}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run as root: sudo $0 [path/to/mosquitto.env] [purge_packages=true|false]"
