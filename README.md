@@ -1,7 +1,6 @@
 # Mosquitto MQTT VPS Installer (Ubuntu 24.04 LTS)
 
 This repo installs and configures an internet-facing Mosquitto broker with:
-
 - MQTT over TLS (port 8883) by default
 - Let’s Encrypt automation (certbot standalone)
 - A renewal **deploy hook** that restarts Mosquitto after successful certificate renewal
@@ -19,7 +18,6 @@ This repo installs and configures an internet-facing Mosquitto broker with:
 If you want “a username/password per top-level topic”, you *need* ACLs, otherwise any valid user could read/write any topic.
 
 ## Files
-
 - `install_mosquitto_vps.sh` — install + configure Mosquitto + certbot + renewal hook
 - `uninstall_mosquitto_vps.sh` — remove managed config and data; optionally purge packages
 - `mosquitto.env.example` — template config (safe to commit)
@@ -27,7 +25,6 @@ If you want “a username/password per top-level topic”, you *need* ACLs, othe
 - `.gitignore` — prevents committing secrets
 
 ## Prerequisites
-
 1. DNS for your broker name must resolve to your VPS public IP.
 2. Inbound ports allowed at both provider firewall and UFW:
    - 22/tcp (SSH)
@@ -35,16 +32,13 @@ If you want “a username/password per top-level topic”, you *need* ACLs, othe
    - 8883/tcp (MQTT over TLS)
 
 ## Install
-
 1) Copy the template:
-
 ```bash
 cp mosquitto.env.example mosquitto.env
 nano mosquitto.env
 ```
 
 2) Set at minimum in `mosquitto.env`:
-
 - `LETSENCRYPT_DOMAIN` (recommended: `mqtt.yourdomain.com`)
 - `LETSENCRYPT_EMAIL`
 - TLS paths for Mosquitto:
@@ -53,14 +47,12 @@ nano mosquitto.env
   - `MOSQ_KEY_FILE=/etc/letsencrypt/live/<domain>/privkey.pem`
 
 3) Run the installer:
-
 ```bash
 sudo chmod +x install_mosquitto_vps.sh uninstall_mosquitto_vps.sh
 sudo ./install_mosquitto_vps.sh ./mosquitto.env
 ```
 
 ## Verify
-
 ```bash
 sudo systemctl status mosquitto --no-pager
 sudo ss -lntp | grep mosquitto
@@ -68,14 +60,12 @@ sudo tail -n 50 /var/log/mosquitto/mosquitto.log
 ```
 
 Renewal hook (installed by script):
-
 ```bash
 sudo ls -l /etc/letsencrypt/renewal-hooks/deploy/restart-mosquitto.sh
 sudo certbot renew --dry-run
 ```
 
 Cert health check:
-
 ```bash
 ./scripts/cert_health_check.sh <domain>
 ```
@@ -84,7 +74,6 @@ Cert health check:
 Passwords are stored hashed in `/etc/mosquitto/passwd` (default from env).
 
 Add a user:
-
 ```bash
 sudo mosquitto_passwd /etc/mosquitto/passwd <username>
 sudo systemctl restart mosquitto
@@ -93,22 +82,18 @@ sudo systemctl restart mosquitto
 ## Recommended: per-top-level-topic users via ACLs
 
 ### 1) Create users
-
 Example:
-
 ```bash
 sudo mosquitto_passwd /etc/mosquitto/passwd watergauge_user
 sudo mosquitto_passwd /etc/mosquitto/passwd mqttplot_user
 ```
 
 ### 2) Create/edit ACL file
-
 ```bash
 sudo nano /etc/mosquitto/aclfile
 ```
 
 Example ACL rules:
-
 ```conf
 # watergauge_user can publish sensor data and read its command topics
 user watergauge_user
@@ -125,27 +110,22 @@ topic readwrite #
 ```
 
 Apply:
-
 ```bash
 sudo systemctl restart mosquitto
 ```
 
 ### Why this is recommended
-
 - Limits blast radius if a credential leaks
 - Lets you share the broker safely among systems
 - Keeps the broker configuration simple
 
 ## Uninstall
-
 Keep packages:
-
 ```bash
 sudo ./uninstall_mosquitto_vps.sh ./mosquitto.env false
 ```
 
 Purge packages:
-
 ```bash
 sudo ./uninstall_mosquitto_vps.sh ./mosquitto.env true
 ```
