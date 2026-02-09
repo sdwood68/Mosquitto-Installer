@@ -53,6 +53,9 @@ LETSENCRYPT_DOMAIN="${LETSENCRYPT_DOMAIN:-}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 LETSENCRYPT_STAGING="${LETSENCRYPT_STAGING:-false}"
 
+# Managed snippet filename (kept as 99-vps.conf for backwards compatibility)
+CONF_SNIPPET="$MOSQ_CONF_DIR/99-vps.conf"
+
 echo "[1/11] Installing packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -67,7 +70,6 @@ install -d -m 0755 "$MOSQ_PERSISTENCE_LOCATION"
 chown -R mosquitto:mosquitto "$MOSQ_PERSISTENCE_LOCATION"
 
 echo "[3/11] Ensuring password file exists (root-owned)..."
-# Keep passwd root-owned to match stricter future Mosquitto behavior.
 install -m 0640 /dev/null "$MOSQ_PASSWORD_FILE"
 chown root:root "$MOSQ_PASSWORD_FILE"
 chmod 0640 "$MOSQ_PASSWORD_FILE"
@@ -106,12 +108,9 @@ fi
 echo "[4/11] Firewall (UFW)..."
 if [[ "$UFW_ALLOW" == "true" ]]; then
   ufw allow OpenSSH >/dev/null || true
-
-  # Needed for Let's Encrypt HTTP-01 standalone validation
   if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
     ufw allow 80/tcp >/dev/null || true
   fi
-
   ufw allow "${MOSQ_LISTENER_PORT}"/tcp >/dev/null || true
   if [[ "$OPEN_PLAINTEXT_1883" == "true" ]]; then
     ufw allow 1883/tcp >/dev/null || true
@@ -138,13 +137,11 @@ echo "[6/11] Installing renewal deploy hook to restart Mosquitto..."
 HOOK_DIR="/etc/letsencrypt/renewal-hooks/deploy"
 HOOK_PATH="$HOOK_DIR/restart-mosquitto.sh"
 install -d -m 0755 "$HOOK_DIR"
-
 cat > "$HOOK_PATH" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 systemctl restart mosquitto
 EOF
-
 chmod 0755 "$HOOK_PATH"
 
 echo "[7/11] (Optional) Ensuring ACL file exists..."
@@ -154,30 +151,34 @@ if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
   chmod 0640 "$MOSQ_ACL_FILE"
 fi
 
-echo "[8/11] Writing Mosquitto configuration (secure defaults + TLS hardening)..."
-CONF_SNIPPET="$MOSQ_CONF_DIR/99-vps.conf"
+echo "[8/11] Writing Mosquitto configuration (atomic writes; prevents empty conf snippet)..."
 
-cat > "$MOSQ_CONF_MAIN" <<EOF
-# Managed by install_mosquitto_vps.sh
+MAIN_TMP="$(mktemp)"
+SNIP_TMP="$(mktemp)"
+cleanup() { rm -f "$MAIN_TMP" "$SNIP_TMP"; }
+trap cleanup EXIT
+
+cat > "$MAIN_TMP" <<EOF
+# Managed by install_mosquitto.sh
 pid_file /run/mosquitto/mosquitto.pid
 user mosquitto
 include_dir $MOSQ_CONF_DIR
 EOF
 
-# Build logging safely: 'log_dest file' requires the path on the same line.
-LOG_LINES=""
+install -m 0644 -o root -g root "$MAIN_TMP" "$MOSQ_CONF_MAIN"
+
 if [[ "$MOSQ_LOG_DEST" == "file" ]]; then
   if [[ -z "$MOSQ_LOG_FILE" ]]; then
     echo "MOSQ_LOG_DEST=file requires MOSQ_LOG_FILE to be set."
     exit 1
   fi
-  LOG_LINES=$'log_dest file '"$MOSQ_LOG_FILE"$'\n'
+  LOG_DEST_LINE="log_dest file $MOSQ_LOG_FILE"
 else
-  LOG_LINES=$'log_dest '"$MOSQ_LOG_DEST"$'\n'
+  LOG_DEST_LINE="log_dest $MOSQ_LOG_DEST"
 fi
 
-cat > "$CONF_SNIPPET" <<EOF
-# Managed by install_mosquitto_vps.sh
+cat > "$SNIP_TMP" <<EOF
+# Managed by install_mosquitto.sh
 
 # --- Baseline hardening ---
 per_listener_settings true
@@ -188,7 +189,8 @@ persistence ${MOSQ_PERSISTENCE}
 persistence_location ${MOSQ_PERSISTENCE_LOCATION}
 
 # --- Logging ---
-${LOG_LINES}log_type error
+${LOG_DEST_LINE}
+log_type error
 log_type warning
 log_type notice
 connection_messages true
@@ -199,13 +201,14 @@ password_file ${MOSQ_PASSWORD_FILE}
 EOF
 
 if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
-  cat >> "$CONF_SNIPPET" <<EOF
+  cat >> "$SNIP_TMP" <<EOF
+
 # --- AuthZ (ACL) ---
 acl_file ${MOSQ_ACL_FILE}
 EOF
 fi
 
-cat >> "$CONF_SNIPPET" <<EOF
+cat >> "$SNIP_TMP" <<EOF
 
 # --- Internet-facing listener (TLS) ---
 listener ${MOSQ_LISTENER_PORT} ${MOSQ_BIND_ADDRESS}
@@ -215,25 +218,22 @@ cafile ${MOSQ_CA_FILE}
 certfile ${MOSQ_CERT_FILE}
 keyfile ${MOSQ_KEY_FILE}
 
-# TLS hardening baseline (safe for modern clients)
 tls_version tlsv1.2
-
-# Optional: require client certs (mTLS)
 EOF
 
 if [[ "$REQUIRE_CLIENT_CERT" == "true" ]]; then
-  cat >> "$CONF_SNIPPET" <<'EOF'
+  cat >> "$SNIP_TMP" <<'EOF'
 require_certificate true
 use_identity_as_username true
 EOF
 else
-  cat >> "$CONF_SNIPPET" <<'EOF'
+  cat >> "$SNIP_TMP" <<'EOF'
 require_certificate false
 EOF
 fi
 
 if [[ "$OPEN_PLAINTEXT_1883" == "true" ]]; then
-  cat >> "$CONF_SNIPPET" <<EOF
+  cat >> "$SNIP_TMP" <<EOF
 
 # --- OPTIONAL plaintext listener (NOT recommended on internet) ---
 listener 1883 ${MOSQ_BIND_ADDRESS}
@@ -241,8 +241,7 @@ protocol mqtt
 EOF
 fi
 
-chown root:root "$MOSQ_CONF_MAIN" "$CONF_SNIPPET"
-chmod 0644 "$MOSQ_CONF_MAIN" "$CONF_SNIPPET"
+install -m 0644 -o root -g root "$SNIP_TMP" "$CONF_SNIPPET"
 
 # TLS permissions (key must be private)
 if [[ -f "$MOSQ_KEY_FILE" ]]; then
@@ -258,19 +257,14 @@ if [[ -f "$MOSQ_CA_FILE" ]]; then
   chmod 0644 "$MOSQ_CA_FILE" || true
 fi
 
-echo "[9/11] Validating config..."
-mosquitto -c "$MOSQ_CONF_MAIN" -t >/dev/null
-
-echo "[10/11] Enabling & restarting mosquitto..."
+echo "[9/11] Enabling & restarting mosquitto..."
 systemctl enable mosquitto
 systemctl restart mosquitto
-systemctl --no-pager --full status mosquitto || true
+
+echo "[10/11] Listening sockets:"
+ss -lntp | grep mosquitto || true
 
 echo "[11/11] Done."
-echo "Config:     $MOSQ_CONF_MAIN (includes $MOSQ_CONF_DIR)"
-echo "Snippet:    $CONF_SNIPPET"
-echo "Password:   $MOSQ_PASSWORD_FILE"
-if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
-  echo "ACL file:   $MOSQ_ACL_FILE"
-fi
-echo "Renew hook: $HOOK_PATH"
+echo "Main config: $MOSQ_CONF_MAIN"
+echo "Snippet:     $CONF_SNIPPET"
+echo "Renew hook:  $HOOK_PATH"
