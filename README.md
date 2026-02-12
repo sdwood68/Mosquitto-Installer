@@ -31,9 +31,10 @@ Mosquitto must read:
 
 Installer sets both to `root:mosquitto 0640`.
 
-### 3) Do not accidentally expose 1883
-Installer writes `port 0` defensively and only adds a plaintext listener if
-`OPEN_PLAINTEXT_1883=true`.
+### 3) Plaintext listener
+Mosquitto does **not** support `port 0` (it errors with “Invalid port value (0)”).
+To keep 1883 closed, we simply do **not** configure a plaintext listener unless
+`OPEN_PLAINTEXT_1883=true` (and we only open UFW 1883 in that case).
 
 ## Install
 
