@@ -1,3 +1,4 @@
+\
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -29,7 +30,6 @@ req MOSQ_LISTENER_PORT
 req MOSQ_BIND_ADDRESS
 req MOSQ_CONF_MAIN
 req MOSQ_CONF_DIR
-req MOSQ_TLS_DIR
 req MOSQ_CA_FILE
 req MOSQ_CERT_FILE
 req MOSQ_KEY_FILE
@@ -46,32 +46,33 @@ req REQUIRE_CLIENT_CERT
 # Optional ACL
 MOSQ_ENABLE_ACL="${MOSQ_ENABLE_ACL:-false}"
 MOSQ_ACL_FILE="${MOSQ_ACL_FILE:-/etc/mosquitto/aclfile}"
+WRITE_DEFAULT_ACL="${WRITE_DEFAULT_ACL:-false}"
+ACL_TOPIC_PREFIX="${ACL_TOPIC_PREFIX:-test/#}"
 
 # Optional Let's Encrypt automation variables
 LETSENCRYPT_ENABLE="${LETSENCRYPT_ENABLE:-false}"
 LETSENCRYPT_DOMAIN="${LETSENCRYPT_DOMAIN:-}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 LETSENCRYPT_STAGING="${LETSENCRYPT_STAGING:-false}"
+LETSENCRYPT_FIX_DIR_PERMS="${LETSENCRYPT_FIX_DIR_PERMS:-true}"
 
-# Managed snippet filename (kept as 99-vps.conf for backwards compatibility)
+# Managed snippet filename
 CONF_SNIPPET="$MOSQ_CONF_DIR/99-vps.conf"
 
-echo "[1/11] Installing packages..."
+echo "[1/12] Installing packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y mosquitto mosquitto-clients ufw openssl certbot
 
-echo "[2/11] Creating directories..."
+echo "[2/12] Creating directories..."
 install -d -m 0755 "$MOSQ_CONF_DIR"
-install -d -m 0750 "$MOSQ_TLS_DIR"
 install -d -m 0755 "$(dirname "$MOSQ_LOG_FILE")"
 install -d -m 0755 "$MOSQ_PERSISTENCE_LOCATION"
-
 chown -R mosquitto:mosquitto "$MOSQ_PERSISTENCE_LOCATION"
 
-echo "[3/11] Ensuring password file exists (root-owned)..."
+echo "[3/12] Ensuring password file exists (root-owned, mosquitto-readable)..."
 install -m 0640 /dev/null "$MOSQ_PASSWORD_FILE"
-chown root:root "$MOSQ_PASSWORD_FILE"
+chown root:mosquitto "$MOSQ_PASSWORD_FILE"
 chmod 0640 "$MOSQ_PASSWORD_FILE"
 
 create_user() {
@@ -93,7 +94,8 @@ create_user() {
   fi
 
   mosquitto_passwd -b "$MOSQ_PASSWORD_FILE" "$user" "$pass"
-  chown root:root "$MOSQ_PASSWORD_FILE"
+  # enforce perms after edits
+  chown root:mosquitto "$MOSQ_PASSWORD_FILE"
   chmod 0640 "$MOSQ_PASSWORD_FILE"
 }
 
@@ -105,20 +107,21 @@ if [[ "${CREATE_MQTT_USER:-false}" == "true" ]]; then
   create_user "$MQTT_USERNAME" "${MQTT_PASSWORD:-}"
 fi
 
-echo "[4/11] Firewall (UFW)..."
+echo "[4/12] Firewall (UFW)..."
 if [[ "$UFW_ALLOW" == "true" ]]; then
   ufw allow OpenSSH >/dev/null || true
   if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
     ufw allow 80/tcp >/dev/null || true
   fi
   ufw allow "${MOSQ_LISTENER_PORT}"/tcp >/dev/null || true
+  # do NOT open 1883 unless explicitly requested
   if [[ "$OPEN_PLAINTEXT_1883" == "true" ]]; then
     ufw allow 1883/tcp >/dev/null || true
   fi
   ufw --force enable >/dev/null || true
 fi
 
-echo "[5/11] (Optional) Obtaining/refreshing Let's Encrypt cert..."
+echo "[5/12] (Optional) Obtaining/refreshing Let's Encrypt cert..."
 if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
   if [[ -z "$LETSENCRYPT_DOMAIN" || -z "$LETSENCRYPT_EMAIL" ]]; then
     echo "LETSENCRYPT_ENABLE=true but LETSENCRYPT_DOMAIN and/or LETSENCRYPT_EMAIL are empty in env file."
@@ -130,28 +133,76 @@ if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
     CB_ARGS+=(--staging)
   fi
 
-  certbot "${CB_ARGS[@]}"
+  # If cert isn't due for renewal, certbot returns success with a message.
+  certbot "${CB_ARGS[@]}" || true
 fi
 
-echo "[6/11] Installing renewal deploy hook to restart Mosquitto..."
+echo "[6/12] Fixing Let's Encrypt directory traversal permissions (if enabled)..."
+# On some systems /etc/letsencrypt/{live,archive} are 0700 root:root, which
+# prevents mosquitto from traversing symlinks to privkey*.pem.
+if [[ "$LETSENCRYPT_FIX_DIR_PERMS" == "true" ]]; then
+  if [[ -d /etc/letsencrypt/live ]]; then
+    chgrp mosquitto /etc/letsencrypt/live || true
+    chmod 0750 /etc/letsencrypt/live || true
+  fi
+  if [[ -d /etc/letsencrypt/archive ]]; then
+    chgrp mosquitto /etc/letsencrypt/archive || true
+    chmod 0750 /etc/letsencrypt/archive || true
+  fi
+  if [[ -n "$LETSENCRYPT_DOMAIN" ]]; then
+    if [[ -d "/etc/letsencrypt/live/$LETSENCRYPT_DOMAIN" ]]; then
+      chgrp mosquitto "/etc/letsencrypt/live/$LETSENCRYPT_DOMAIN" || true
+      chmod 0750 "/etc/letsencrypt/live/$LETSENCRYPT_DOMAIN" || true
+    fi
+    if [[ -d "/etc/letsencrypt/archive/$LETSENCRYPT_DOMAIN" ]]; then
+      chgrp mosquitto "/etc/letsencrypt/archive/$LETSENCRYPT_DOMAIN" || true
+      chmod 0750 "/etc/letsencrypt/archive/$LETSENCRYPT_DOMAIN" || true
+    fi
+  fi
+fi
+
+echo "[7/12] Installing renewal deploy hook (fix perms + restart Mosquitto)..."
 HOOK_DIR="/etc/letsencrypt/renewal-hooks/deploy"
 HOOK_PATH="$HOOK_DIR/restart-mosquitto.sh"
 install -d -m 0755 "$HOOK_DIR"
 cat > "$HOOK_PATH" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+
+# Ensure mosquitto can traverse LE symlinks on hardened hosts
+if [[ -d /etc/letsencrypt/live ]]; then
+  chgrp mosquitto /etc/letsencrypt/live || true
+  chmod 0750 /etc/letsencrypt/live || true
+fi
+if [[ -d /etc/letsencrypt/archive ]]; then
+  chgrp mosquitto /etc/letsencrypt/archive || true
+  chmod 0750 /etc/letsencrypt/archive || true
+fi
+
 systemctl restart mosquitto
 EOF
 chmod 0755 "$HOOK_PATH"
 
-echo "[7/11] (Optional) Ensuring ACL file exists..."
+echo "[8/12] (Optional) Ensuring ACL file exists..."
 if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
   install -m 0640 /dev/null "$MOSQ_ACL_FILE"
-  chown root:root "$MOSQ_ACL_FILE"
+  chown root:mosquitto "$MOSQ_ACL_FILE"
   chmod 0640 "$MOSQ_ACL_FILE"
 fi
 
-echo "[8/11] Writing Mosquitto configuration (atomic writes; prevents empty conf snippet)..."
+if [[ "$MOSQ_ENABLE_ACL" == "true" && "$WRITE_DEFAULT_ACL" == "true" && "${CREATE_MQTT_USER:-false}" == "true" ]]; then
+  echo "[9/12] Writing starter ACL for initial user..."
+  cat > "$MOSQ_ACL_FILE" <<EOF
+user ${MQTT_USERNAME}
+topic readwrite ${ACL_TOPIC_PREFIX}
+EOF
+  chown root:mosquitto "$MOSQ_ACL_FILE"
+  chmod 0640 "$MOSQ_ACL_FILE"
+else
+  echo "[9/12] Skipping starter ACL (MOSQ_ENABLE_ACL=$MOSQ_ENABLE_ACL, WRITE_DEFAULT_ACL=$WRITE_DEFAULT_ACL)."
+fi
+
+echo "[10/12] Writing Mosquitto configuration (atomic writes)..."
 
 MAIN_TMP="$(mktemp)"
 SNIP_TMP="$(mktemp)"
@@ -164,8 +215,10 @@ pid_file /run/mosquitto/mosquitto.pid
 user mosquitto
 include_dir $MOSQ_CONF_DIR
 EOF
-
 install -m 0644 -o root -g root "$MAIN_TMP" "$MOSQ_CONF_MAIN"
+
+# Prevent any default listener on 1883 (defensive hardening).
+PORT0_LINE="port 0"
 
 if [[ "$MOSQ_LOG_DEST" == "file" ]]; then
   if [[ -z "$MOSQ_LOG_FILE" ]]; then
@@ -179,6 +232,8 @@ fi
 
 cat > "$SNIP_TMP" <<EOF
 # Managed by install_mosquitto.sh
+
+${PORT0_LINE}
 
 # --- Baseline hardening ---
 per_listener_settings true
@@ -243,28 +298,15 @@ fi
 
 install -m 0644 -o root -g root "$SNIP_TMP" "$CONF_SNIPPET"
 
-# TLS permissions (key must be private)
-if [[ -f "$MOSQ_KEY_FILE" ]]; then
-  chown mosquitto:mosquitto "$MOSQ_KEY_FILE" || true
-  chmod 0640 "$MOSQ_KEY_FILE" || true
-fi
-if [[ -f "$MOSQ_CERT_FILE" ]]; then
-  chown mosquitto:mosquitto "$MOSQ_CERT_FILE" || true
-  chmod 0644 "$MOSQ_CERT_FILE" || true
-fi
-if [[ -f "$MOSQ_CA_FILE" ]]; then
-  chown mosquitto:mosquitto "$MOSQ_CA_FILE" || true
-  chmod 0644 "$MOSQ_CA_FILE" || true
-fi
-
-echo "[9/11] Enabling & restarting mosquitto..."
+echo "[11/12] Enabling & restarting mosquitto..."
 systemctl enable mosquitto
+systemctl reset-failed mosquitto || true
 systemctl restart mosquitto
 
-echo "[10/11] Listening sockets:"
+echo "[12/12] Listening sockets:"
 ss -lntp | grep mosquitto || true
 
-echo "[11/11] Done."
+echo "Done."
 echo "Main config: $MOSQ_CONF_MAIN"
 echo "Snippet:     $CONF_SNIPPET"
 echo "Renew hook:  $HOOK_PATH"

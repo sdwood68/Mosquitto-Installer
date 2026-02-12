@@ -1,96 +1,76 @@
-# Mosquitto MQTT VPS Installer (Ubuntu 24.04 LTS)
+# Mosquitto Installer (Ubuntu 24.04 LTS)
 
-This repo installs and configures an internet-facing Mosquitto broker with:
+Security-first Mosquitto broker installer for an internet-facing VPS.
 
-- MQTT over TLS (8883) by default
-- Let’s Encrypt automation (certbot standalone)
-- Renewal **deploy hook** that restarts Mosquitto after successful cert renewal
-- Username/password authentication (no anonymous)
-- Optional ACL enforcement (recommended)
+## What’s included
+- TLS listener on 8883
+- Optional Let's Encrypt issuance via certbot standalone
+- Cert renewal deploy hook that:
+  - re-applies hardened LE directory permissions (when needed)
+  - restarts Mosquitto so it picks up new keys
+- Username/password auth
+- Optional ACL authorization (recommended)
 
-## What was fixed
+## Key lessons baked into the installer
 
-The installer now writes `/etc/mosquitto/conf.d/99-vps.conf` using **atomic writes** (temp file + install).
-This prevents the `0 bytes` snippet situation that leaves Mosquitto in local-only mode.
+### 1) Let's Encrypt directory traversal
+Some hosts keep:
+- `/etc/letsencrypt/live` as `0700 root:root`
+- `/etc/letsencrypt/archive` as `0700 root:root`
 
-## What is an ACL?
+Mosquitto cannot traverse the symlink chain from:
+`/etc/letsencrypt/live/<domain>/privkey.pem -> ../../archive/<domain>/privkeyN.pem`
 
-**ACL** = **Access Control List**. In Mosquitto, ACL rules control **which users** can
-**publish/subscribe** to **which topics**.
+If `LETSENCRYPT_FIX_DIR_PERMS=true`, the installer sets group `mosquitto`
+and mode `0750` on these directories (and per-domain subdirs when the domain is known).
 
-- Passwords authenticate (“who are you?”)
-- ACLs authorize (“what are you allowed to do?”)
+### 2) Password + ACL file permissions
+Mosquitto must read:
+- `/etc/mosquitto/passwd`
+- `/etc/mosquitto/aclfile` (if enabled)
 
-If you want “one username/password per top-level topic”, you need ACLs.
+Installer sets both to `root:mosquitto 0640`.
 
-## Note about logging
-
-Mosquitto’s `log_dest file` requires the path on the same line:
-
-```text
-log_dest file /var/log/mosquitto/mosquitto.log
-```
-
-This installer handles it automatically when `MOSQ_LOG_DEST=file`.
+### 3) Do not accidentally expose 1883
+Installer writes `port 0` defensively and only adds a plaintext listener if
+`OPEN_PLAINTEXT_1883=true`.
 
 ## Install
 
 ```bash
 cp mosquitto.env.example mosquitto.env
 nano mosquitto.env
-sudo chmod +x install_mosquitto_vps.sh uninstall_mosquitto_vps.sh
-sudo ./install_mosquitto_vps.sh ./mosquitto.env
+sudo chmod +x install_mosquitto.sh uninstall_mosquitto.sh
+sudo ./install_mosquitto.sh ./mosquitto.env
 ```
 
-## User setup (passwords)
+## Users
 
 ```bash
-sudo mosquitto_passwd /etc/mosquitto/passwd watergauge_user
-sudo mosquitto_passwd /etc/mosquitto/passwd mqttplot_user
+sudo mosquitto_passwd /etc/mosquitto/passwd myuser
 sudo systemctl restart mosquitto
 ```
 
-## ACL example
+## ACLs (Access Control Lists)
 
-Edit:
+ACLs restrict publish/subscribe permissions per user/topic prefix.
 
-```bash
-sudo nano /etc/mosquitto/aclfile
-```
-
-Example:
+Example `/etc/mosquitto/aclfile`:
 
 ```conf
 user watergauge_user
-topic write watergauge/#
-topic read  watergauge/cmd/#
+topic readwrite watergauge/#
 
-user mqttplot_user
-topic read mqttplot/#
-
-user admin
-topic readwrite #
+user garage_user
+topic readwrite garage/#
 ```
 
-Apply:
+If `WRITE_DEFAULT_ACL=true`, the installer writes a starter ACL for the initial
+`MQTT_USERNAME` granting `topic readwrite ACL_TOPIC_PREFIX`.
+
+## Client test (Linux)
+Some older Mosquitto clients do not support `--tls-hostname`. This works broadly:
 
 ```bash
-sudo systemctl restart mosquitto
-```
-
-## Renewal hook
-
-Installed at:
-`/etc/letsencrypt/renewal-hooks/deploy/restart-mosquitto.sh`
-
-Dry-run renew:
-
-```bash
-sudo certbot renew --dry-run
-```
-
-## Cert health check
-
-```bash
-./scripts/cert_health_check.sh <domain>
+mosquitto_sub -h mqtt.example.com -p 8883 --capath /etc/ssl/certs   -u myuser -P 'mypassword' -t 'test/#' -v -d
 ```
