@@ -1,4 +1,3 @@
-\
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -133,10 +132,13 @@ if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
     CB_ARGS+=(--staging)
   fi
 
+  # If cert isn't due for renewal, certbot returns success with a message.
   certbot "${CB_ARGS[@]}" || true
 fi
 
 echo "[6/12] Fixing Let's Encrypt directory traversal permissions (if enabled)..."
+# On some systems /etc/letsencrypt/{live,archive} are 0700 root:root, which
+# prevents mosquitto from traversing symlinks to privkey*.pem.
 if [[ "$LETSENCRYPT_FIX_DIR_PERMS" == "true" ]]; then
   if [[ -d /etc/letsencrypt/live ]]; then
     chgrp mosquitto /etc/letsencrypt/live || true
@@ -166,6 +168,7 @@ cat > "$HOOK_PATH" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
+# Ensure mosquitto can traverse LE symlinks on hardened hosts
 if [[ -d /etc/letsencrypt/live ]]; then
   chgrp mosquitto /etc/letsencrypt/live || true
   chmod 0750 /etc/letsencrypt/live || true
@@ -213,6 +216,9 @@ include_dir $MOSQ_CONF_DIR
 EOF
 install -m 0644 -o root -g root "$MAIN_TMP" "$MOSQ_CONF_MAIN"
 
+# Prevent any default listener on 1883 (defensive hardening).
+PORT0_LINE="port 0"
+
 if [[ "$MOSQ_LOG_DEST" == "file" ]]; then
   if [[ -z "$MOSQ_LOG_FILE" ]]; then
     echo "MOSQ_LOG_DEST=file requires MOSQ_LOG_FILE to be set."
@@ -225,6 +231,8 @@ fi
 
 cat > "$SNIP_TMP" <<EOF
 # Managed by install_mosquitto.sh
+
+${PORT0_LINE}
 
 # --- Baseline hardening ---
 per_listener_settings true

@@ -1,4 +1,3 @@
-\
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -56,6 +55,7 @@ if command -v ufw >/dev/null 2>&1; then
   fi
 fi
 
+# Remove mosquitto dirs (leave certbot state intact)
 rm -rf /etc/mosquitto >/dev/null 2>&1 || true
 rm -rf /var/lib/mosquitto /var/log/mosquitto /run/mosquitto >/dev/null 2>&1 || true
 
