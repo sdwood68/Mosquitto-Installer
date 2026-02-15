@@ -1,57 +1,85 @@
-# Mosquitto Installer (Ubuntu 24.04 LTS)
+# Mosquitto Installer for Ubuntu 24.04 LTS
 
 Security-first Mosquitto broker installer for an internet-facing VPS.
 
-## What’s included
+## Requirements
 
-- TLS listener on 8883  
-- Optional Let’s Encrypt issuance via certbot standalone  
+- Ubuntu 24.04 LTS (Noble)
+- Mosquitto from Ubuntu packages (tested with mosquitto 2.0.18)
+
+## What this installs
+
+- TLS listener on port 8883
+- Optional Let's Encrypt issuance via certbot (standalone)
 - Cert renewal deploy hook that:
-  - re-applies hardened LE directory permissions when needed  
-  - restarts Mosquitto so it picks up new keys  
-- Username/password authentication  
+  - re-applies hardened Let's Encrypt directory permissions
+  - restarts Mosquitto so it picks up new keys
+- Username/password authentication
 - Optional ACL authorization (recommended)
 
-## Key lessons baked into the installer
+## Notes and gotchas
 
-### 1) Let’s Encrypt directory traversal
+### Let's Encrypt directory traversal
 
-Some hosts keep:
+Some hosts keep these as `0700 root:root`:
 
-- `/etc/letsencrypt/live` as `0700 root:root`  
-- `/etc/letsencrypt/archive` as `0700 root:root`
+- `/etc/letsencrypt/live`
+- `/etc/letsencrypt/archive`
 
 Mosquitto cannot traverse the symlink chain from:
 
-`/etc/letsencrypt/live/<domain>/privkey.pem` →  
-`../../archive/<domain>/privkeyN.pem`
+- `/etc/letsencrypt/live/<domain>/privkey.pem`
+- `../../archive/<domain>/privkeyN.pem`
 
-If `LETSENCRYPT_FIX_DIR_PERMS=true`, the installer sets group
-`mosquitto` and mode `0750` on these directories and per-domain
-subdirectories when the domain is known.
+If `LETSENCRYPT_FIX_DIR_PERMS=true`, the installer sets group `mosquitto` and
+mode `0750` on these directories and per-domain subdirectories.
 
-### 2) Password + ACL file permissions
+### Plaintext listener and the 1883 double-bind issue
 
-Mosquitto must read:
+On Ubuntu 24.04 with Mosquitto 2.0.18, using an explicit stanza like:
 
-- `/etc/mosquitto/passwd`  
-- `/etc/mosquitto/aclfile` if ACLs are enabled
+```conf
+listener 1883 127.0.0.1
+```
 
-Installer sets both to `root:mosquitto 0640`.
+can cause Mosquitto to attempt binding port 1883 twice and fail with:
 
-### 3) Plaintext listener
+- `Error: Address already in use`
 
-Mosquitto does **not** support `port 0`. It errors with:
+To avoid this, if you enable plaintext 1883, the installer uses the legacy
+listener form:
 
-> Invalid port value (0)
+```conf
+bind_address 127.0.0.1
+port 1883
+```
 
-To keep port 1883 closed, we simply do **not** configure a plaintext
-listener unless `OPEN_PLAINTEXT_1883=true`. UFW port 1883 is only opened
-in that case.
+By default, the installer binds port 1883 to localhost even if you open the
+firewall port.
+
+### Password and ACL file permissions
+
+Mosquitto reads:
+
+- `/etc/mosquitto/passwd`
+- `/etc/mosquitto/aclfile` (when ACLs are enabled)
+
+To avoid future Mosquitto warnings, the installer sets these files to
+`mosquitto:mosquitto` with mode `0600`.
+
+### Client ID requirement
+
+This installer sets:
+
+```conf
+allow_zero_length_clientid false
+```
+
+So your test clients must provide a client id via `-i`.
 
 ## Install
 
-``` bash
+```bash
 cp mosquitto.env.example mosquitto.env
 nano mosquitto.env
 sudo chmod +x install_mosquitto.sh uninstall_mosquitto.sh
@@ -60,37 +88,101 @@ sudo ./install_mosquitto.sh ./mosquitto.env
 
 ## Users
 
-``` bash
+Add users later with:
+
+```bash
 sudo mosquitto_passwd /etc/mosquitto/passwd myuser
 sudo systemctl restart mosquitto
 ```
 
 ## ACLs (Access Control Lists)
 
-ACLs restrict publish and subscribe permissions per user or topic
-prefix.
+If `MOSQ_ENABLE_ACL=true`, you must define topic permissions. An empty ACL file
+can result in clients connecting successfully but being unable to publish or
+subscribe.
 
 Example `/etc/mosquitto/aclfile`:
 
-``` conf
-user watergauge_user
+```conf
+# Test topics
+user watergauge
+topic readwrite test/#
+
+# WaterGauge topics
+user watergauge
 topic readwrite watergauge/#
 
-user garage_user
-topic readwrite garage/#
+# Example: read-only user
+# user mqttplot
+# topic read watergauge/#
 ```
 
-If `WRITE_DEFAULT_ACL=true`, the installer writes a starter ACL for the
-initial `MQTT_USERNAME` granting:
+If `WRITE_DEFAULT_ACL=true` and `CREATE_MQTT_USER=true`, the installer seeds a
+starter rule for the initial user:
 
-`topic readwrite ACL_TOPIC_PREFIX`
+- `topic readwrite ACL_TOPIC_PREFIX`
 
-## Client test (Linux)
 
-Some older Mosquitto clients do not support `--tls-hostname`. This works
-reliably:
+## Test scripts
 
-``` bash
-mosquitto_sub -h mqtt.example.com -p 8883 --capath /etc/ssl/certs \
-  -u myuser -P 'mypassword' -t 'test/#' -v -d
+Run quick end-to-end one-shot tests (subscribe then publish) on the VPS.
+
+```bash
+chmod +x scripts/test_oneshot_*.sh
+
+# TLS (8883) one-shot
+auth_env=./mosquitto.env
+./scripts/test_oneshot_tls.sh "$auth_env" test/tls
+
+# Local plaintext (127.0.0.1:1883) one-shot
+./scripts/test_oneshot_local.sh "$auth_env" test/baseline
+
+# Run both
+./scripts/test_oneshot_all.sh "$auth_env"
 ```
+
+Notes:
+- These scripts require `timeout` (coreutils).
+- TLS script uses `LETSENCRYPT_DOMAIN` and `MOSQ_LISTENER_PORT` from the env file.
+- Both scripts require `MQTT_USERNAME` and `MQTT_PASSWORD`.
+
+## Client tests
+
+### Linux
+
+TLS subscribe:
+
+```bash
+mosquitto_sub -h mqtt.example.com -p 8883 \
+  --cafile /etc/ssl/certs/ca-certificates.crt \
+  -i "test-sub-$(date +%s)" \
+  -u myuser -P 'mypassword' \
+  -t 'test/#' -v
+```
+
+TLS publish:
+
+```bash
+mosquitto_pub -h mqtt.example.com -p 8883 \
+  --cafile /etc/ssl/certs/ca-certificates.crt \
+  -i "test-pub-$(date +%s)" \
+  -u myuser -P 'mypassword' \
+  -t 'test/hello' -m "hello $(date -Is)" -q 1
+```
+
+### Windows PowerShell
+
+Use the full path to the Mosquitto client binaries, or ensure they are on your
+`PATH`. Example (edit host, user, and password):
+
+```powershell
+& "C:\Program Files\mosquitto\mosquitto_sub.exe" `
+  -h mqtt.example.com -p 8883 `
+  --cafile "C:\Program Files\mosquitto\certs\ca.crt" `
+    -i "test-sub-$([guid]::NewGuid().ToString())" `
+  -u myuser -P "mypassword" `
+  -t "test/#" -v
+```
+
+If you do not have a CA bundle on Windows, export the system roots to a file
+or use the CA provided by your environment.

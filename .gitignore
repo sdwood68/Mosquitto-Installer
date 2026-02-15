@@ -28,3 +28,6 @@ Thumbs.db
 # Shell artifacts
 *.bak
 *.tmp
+
+Zip files
+*.zip   
