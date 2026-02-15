@@ -122,7 +122,6 @@ starter rule for the initial user:
 
 - `topic readwrite ACL_TOPIC_PREFIX`
 
-
 ## Test scripts
 
 Run quick end-to-end one-shot tests (subscribe then publish) on the VPS.
@@ -142,6 +141,7 @@ auth_env=./mosquitto.env
 ```
 
 Notes:
+
 - These scripts require `timeout` (coreutils).
 - TLS script uses `LETSENCRYPT_DOMAIN` and `MOSQ_LISTENER_PORT` from the env file.
 - Both scripts require `MQTT_USERNAME` and `MQTT_PASSWORD`.
