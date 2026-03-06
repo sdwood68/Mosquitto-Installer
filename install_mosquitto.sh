@@ -218,7 +218,7 @@ if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
   } > "$MOSQ_ACL_FILE"
 
   chown mosquitto:mosquitto "$MOSQ_ACL_FILE"
-  chmod 0600 "$MOSQ_ACL_FILE"
+  chmod 0644 "$MOSQ_ACL_FILE"
 fi
 
 echo "[9/12] Writing Mosquitto configuration (atomic write)..."
@@ -247,13 +247,13 @@ allow_zero_length_clientid false
 # -------------------------------------------------------------------
 # Persistence
 # -------------------------------------------------------------------
-persistence ${MOSQ_PERSISTENCE}
-persistence_location ${MOSQ_PERSISTENCE_LOCATION}
+persistence true
+persistence_location /var/lib/mosquitto/
 
 # -------------------------------------------------------------------
 # Logging
 # -------------------------------------------------------------------
-${LOG_DEST_LINE}
+log_dest file /var/log/mosquitto/mosquitto.log
 log_type error
 log_type warning
 log_type notice
@@ -262,8 +262,30 @@ connection_messages true
 # -------------------------------------------------------------------
 # AuthN/AuthZ
 # -------------------------------------------------------------------
-allow_anonymous ${MOSQ_ALLOW_ANONYMOUS}
-password_file ${MOSQ_PASSWORD_FILE}
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+acl_file /etc/mosquitto/aclfile
+
+# -------------------------------------------------------------------
+# Internet-facing TLS listener
+# -------------------------------------------------------------------
+listener 8883 0.0.0.0
+protocol mqtt
+
+certfile /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+keyfile /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+
+tls_version tlsv1.2
+require_certificate false
+
+# -------------------------------------------------------------------
+# Localhost plaintext listener (MQTTPlot)
+# -------------------------------------------------------------------
+listener 1883 127.0.0.1
+protocol mqtt
+
+pid_file /run/mosquitto/mosquitto.pid
+user mosquitto
 EOF
 
 if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then

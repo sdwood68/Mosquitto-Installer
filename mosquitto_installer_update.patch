@@ -1,0 +1,116 @@
+*** Begin Patch
+*** Update File: scripts/install_mosquitto.sh
+@@
+-# Write Mosquitto configuration
+-cat >/etc/mosquitto/mosquitto.conf <<EOF
+-# Managed by install_mosquitto.sh
+-
+-allow_zero_length_clientid false
+-persistence true
+-persistence_location /var/lib/mosquitto/
+-
+-log_dest file /var/log/mosquitto/mosquitto.log
+-log_type error
+-log_type warning
+-log_type notice
+-connection_messages true
+-
+-allow_anonymous false
+-password_file /etc/mosquitto/passwd
+-acl_file /etc/mosquitto/aclfile
+-
+-listener 8883 0.0.0.0
+-listener 1883 127.0.0.1
+-protocol mqtt
+-
+-cafile /etc/letsencrypt/live/${MQTT_DOMAIN}/fullchain.pem
+-certfile /etc/letsencrypt/live/${MQTT_DOMAIN}/fullchain.pem
+-keyfile /etc/letsencrypt/live/${MQTT_DOMAIN}/privkey.pem
+-
+-tls_version tlsv1.2
+-require_certificate false
+-
+-pid_file /run/mosquitto/mosquitto.pid
+-user mosquitto
+-EOF
++# Write Mosquitto configuration
++# Notes:
++# - 8883 is the internet-facing TLS listener.
++# - 1883 is plaintext but bound to 127.0.0.1 only for local apps such as
++#   MQTTPlot.
++# - Do NOT set cafile for this server-side configuration unless client
++#   certificate authentication is being used. With require_certificate false,
++#   certfile + keyfile are sufficient.
++cat >/etc/mosquitto/mosquitto.conf <<EOF
++# Managed by install_mosquitto.sh
++
++# -------------------------------------------------------------------
++# Baseline hardening
++# -------------------------------------------------------------------
++allow_zero_length_clientid false
++
++# -------------------------------------------------------------------
++# Persistence
++# -------------------------------------------------------------------
++persistence true
++persistence_location /var/lib/mosquitto/
++
++# -------------------------------------------------------------------
++# Logging
++# -------------------------------------------------------------------
++log_dest file /var/log/mosquitto/mosquitto.log
++log_type error
++log_type warning
++log_type notice
++connection_messages true
++
++# -------------------------------------------------------------------
++# AuthN/AuthZ
++# -------------------------------------------------------------------
++allow_anonymous false
++password_file /etc/mosquitto/passwd
++acl_file /etc/mosquitto/aclfile
++
++# -------------------------------------------------------------------
++# Internet-facing TLS listener
++# -------------------------------------------------------------------
++listener 8883 0.0.0.0
++protocol mqtt
++
++certfile /etc/letsencrypt/live/${MQTT_DOMAIN}/fullchain.pem
++keyfile /etc/letsencrypt/live/${MQTT_DOMAIN}/privkey.pem
++
++tls_version tlsv1.2
++require_certificate false
++
++# -------------------------------------------------------------------
++# Localhost plaintext listener (for MQTTPlot or other local clients)
++# -------------------------------------------------------------------
++listener 1883 127.0.0.1
++protocol mqtt
++
++pid_file /run/mosquitto/mosquitto.pid
++user mosquitto
++EOF
+@@
+-# Lock down auth files
+-chown root:root /etc/mosquitto/passwd /etc/mosquitto/aclfile
+-chmod 600 /etc/mosquitto/passwd
+-chmod 644 /etc/mosquitto/aclfile
++# Lock down auth files.
++# On this Ubuntu/Mosquitto packaging, mosquitto must be able to read these
++# files directly at runtime, so keep them owned by mosquitto:mosquitto.
++chown mosquitto:mosquitto /etc/mosquitto/passwd /etc/mosquitto/aclfile
++chmod 600 /etc/mosquitto/passwd
++chmod 644 /etc/mosquitto/aclfile
+@@
+-# Verify listeners
+-ss -tlnp | grep -E '(:8883)'
++# Verify listeners
++ss -tlnp | grep -E '(:1883|:8883)'
++
++echo
++echo "Expected listener bindings:"
++echo "  0.0.0.0:8883   (TLS / internet-facing)"
++echo "  127.0.0.1:1883 (plaintext / localhost only)"
+*** End Patch
