@@ -408,13 +408,17 @@ EOF
 
 install -m 0644 -o root -g root "$MAIN_TMP" "$MOSQ_CONF_MAIN"
 
-echo "[10/13] Validating configuration syntax..."
-mosquitto -c "$MOSQ_CONF_MAIN" -t
-
-echo "[11/13] Enabling & restarting mosquitto..."
+echo "[10/13] Enabling & restarting mosquitto..."
 systemctl enable mosquitto
 systemctl reset-failed mosquitto || true
 systemctl restart mosquitto
+
+echo "[11/13] Verifying mosquitto service status..."
+if ! systemctl is-active --quiet mosquitto; then
+  echo "ERROR: mosquitto failed to start."
+  journalctl -u mosquitto -n 100 --no-pager || true
+  exit 1
+fi
 
 echo "[12/13] Verifying listener bindings..."
 verify_listener_bindings
