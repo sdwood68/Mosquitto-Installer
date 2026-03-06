@@ -1,99 +1,213 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage:
-#   sudo ./uninstall_mosquitto.sh [path/to/mosquitto.env] [purge_packages=true|false] [remove_user=true|false]
-#
-# Defaults:
-#   purge_packages=true  (remove mosquitto + clients packages)
-#   remove_user=true     (remove mosquitto system user/group after purge)
+PURGE_PACKAGES=true
+REMOVE_USER=true
+ASSUME_YES=false
 
-ENV_FILE="${1:-./mosquitto.env}"
-PURGE_PACKAGES="${2:-true}"
-REMOVE_USER="${3:-true}"
+usage() {
+  cat <<'EOF'
+Usage: uninstall_mosquitto.sh [options]
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root: sudo $0 [path/to/mosquitto.env] [purge_packages=true|false] [remove_user=true|false]"
+Options:
+  --keep-packages   Stop/disable Mosquitto and remove config/data, but do not
+                    purge mosquitto packages.
+  --keep-user       Do not remove the mosquitto system user/group.
+  -y, --yes         Non-interactive mode.
+  -h, --help        Show this help.
+
+Examples:
+  sudo bash uninstall_mosquitto.sh
+  sudo bash uninstall_mosquitto.sh --keep-packages --keep-user
+EOF
+}
+
+log() {
+  printf '[INFO] %s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[ERROR] %s\n' "$*" >&2
   exit 1
-fi
+}
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Missing env file: $ENV_FILE"
-  exit 1
-fi
-
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-
-MOSQ_ENABLE_ACL="${MOSQ_ENABLE_ACL:-false}"
-MOSQ_ACL_FILE="${MOSQ_ACL_FILE:-/etc/mosquitto/aclfile}"
-LETSENCRYPT_ENABLE="${LETSENCRYPT_ENABLE:-false}"
-
-# --- Stop service (best-effort) ---
-systemctl stop mosquitto >/dev/null 2>&1 || true
-systemctl disable mosquitto >/dev/null 2>&1 || true
-systemctl reset-failed mosquitto >/dev/null 2>&1 || true
-
-# --- Remove our certbot deploy hook ---
-rm -f /etc/letsencrypt/renewal-hooks/deploy/restart-mosquitto.sh
-
-# --- Remove our managed config files (best-effort) ---
-CONF_SNIPPET="${MOSQ_CONF_DIR:-/etc/mosquitto/conf.d}/99-vps.conf"
-rm -f "$CONF_SNIPPET" "${CONF_SNIPPET}.disabled" >/dev/null 2>&1 || true
-
-MAIN_CONF="${MOSQ_CONF_MAIN:-/etc/mosquitto/mosquitto.conf}"
-if [[ -f "$MAIN_CONF" ]] && grep -q "Managed by install_mosquitto.sh" "$MAIN_CONF"; then
-  rm -f "$MAIN_CONF"
-fi
-
-rm -f "${MOSQ_PASSWORD_FILE:-/etc/mosquitto/passwd}" >/dev/null 2>&1 || true
-if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
-  rm -f "$MOSQ_ACL_FILE" >/dev/null 2>&1 || true
-fi
-
-rm -f "${MOSQ_LOG_FILE:-/var/log/mosquitto/mosquitto.log}" >/dev/null 2>&1 || true
-
-if [[ -n "${MOSQ_PERSISTENCE_LOCATION:-}" && -d "${MOSQ_PERSISTENCE_LOCATION:-}" ]]; then
-  rm -rf "${MOSQ_PERSISTENCE_LOCATION:-}" >/dev/null 2>&1 || true
-fi
-
-# --- Firewall cleanup (best-effort) ---
-if command -v ufw >/dev/null 2>&1; then
-  ufw delete allow "${MOSQ_LISTENER_PORT:-8883}"/tcp >/dev/null 2>&1 || true
-  if [[ "${OPEN_PLAINTEXT_1883:-false}" == "true" ]]; then
-    ufw delete allow 1883/tcp >/dev/null 2>&1 || true
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    die "Please run as root (sudo)."
   fi
-  if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
-    ufw delete allow 80/tcp >/dev/null 2>&1 || true
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-packages)
+        PURGE_PACKAGES=false
+        ;;
+      --keep-user)
+        REMOVE_USER=false
+        ;;
+      -y|--yes)
+        ASSUME_YES=true
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+}
+
+confirm() {
+  if [[ "$ASSUME_YES" == true ]]; then
+    return 0
   fi
-fi
 
-# --- Remove dirs we created/used (best-effort) ---
-rm -rf /etc/mosquitto /var/lib/mosquitto /var/log/mosquitto /run/mosquitto >/dev/null 2>&1 || true
+  echo
+  echo "This will uninstall Mosquitto-related components from this host."
+  echo "  purge_packages=$PURGE_PACKAGES"
+  echo "  remove_user=$REMOVE_USER"
+  echo
+  read -r -p "Continue? [y/N]: " reply
+  case "$reply" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      die "Aborted."
+      ;;
+  esac
+}
 
-# --- Purge packages (this removes binaries + systemd units installed by packages) ---
-if [[ "$PURGE_PACKAGES" == "true" ]]; then
-  apt-get purge -y mosquitto mosquitto-clients >/dev/null || true
-  apt-get autoremove -y >/dev/null || true
-  apt-get autoclean -y >/dev/null || true
-fi
+check_apt_lock() {
+  local lock_files=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/cache/apt/archives/lock
+  )
 
-# --- Remove mosquitto system user/group (optional; only makes sense after purge) ---
-if [[ "$REMOVE_USER" == "true" ]]; then
-  # Kill any stray processes
-  pkill -x mosquitto >/dev/null 2>&1 || true
+  local holders=""
+  for lock in "${lock_files[@]}"; do
+    if command -v fuser >/dev/null 2>&1; then
+      local out
+      out="$(fuser "$lock" 2>/dev/null || true)"
+      if [[ -n "$out" ]]; then
+        holders+="$lock held by PID(s): $out"$'\n'
+      fi
+    fi
+  done
 
-  # Remove user/group if they exist
-  if getent passwd mosquitto >/dev/null 2>&1; then
-    userdel mosquitto >/dev/null 2>&1 || true
+  if [[ -n "$holders" ]]; then
+    printf '%s' "$holders" >&2
+    die "apt/dpkg appears to be in use. Wait for it to finish, then retry."
   fi
+}
+
+stop_service() {
+  if systemctl list-unit-files | grep -q '^mosquitto\.service'; then
+    log "Stopping mosquitto service"
+    systemctl stop mosquitto || true
+    systemctl disable mosquitto || true
+  else
+    log "Mosquitto service not installed"
+  fi
+}
+
+purge_packages() {
+  if [[ "$PURGE_PACKAGES" != true ]]; then
+    log "Keeping mosquitto packages (--keep-packages)"
+    return 0
+  fi
+
+  check_apt_lock
+
+  log "Purging mosquitto packages"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get purge -y mosquitto mosquitto-clients
+  apt-get autoremove -y
+}
+
+remove_paths() {
+  log "Removing Mosquitto config/data/log directories"
+  rm -rf /etc/mosquitto
+  rm -rf /var/lib/mosquitto
+  rm -rf /var/log/mosquitto
+
+  log "Removing possible systemd unit leftovers"
+  rm -f /etc/systemd/system/mosquitto.service
+  rm -f /lib/systemd/system/mosquitto.service
+  systemctl daemon-reload || true
+}
+
+remove_user() {
+  if [[ "$REMOVE_USER" != true ]]; then
+    log "Keeping mosquitto user/group (--keep-user)"
+    return 0
+  fi
+
+  if id mosquitto >/dev/null 2>&1; then
+    log "Removing mosquitto system user"
+    userdel mosquitto || true
+  fi
+
   if getent group mosquitto >/dev/null 2>&1; then
-    groupdel mosquitto >/dev/null 2>&1 || true
+    log "Removing mosquitto system group"
+    groupdel mosquitto || true
   fi
-fi
+}
 
-# --- Reload systemd to forget removed units (especially after purge) ---
-systemctl daemon-reload >/dev/null 2>&1 || true
+post_check() {
+  local failed=false
 
-echo "Uninstall complete."
-echo "purge_packages=$PURGE_PACKAGES remove_user=$REMOVE_USER"
+  if systemctl list-unit-files | grep -q '^mosquitto\.service'; then
+    warn "mosquitto.service still exists after uninstall"
+    failed=true
+  fi
+
+  if dpkg -l | awk '{print $2}' | grep -qx mosquitto; then
+    warn "mosquitto package still installed"
+    failed=true
+  fi
+
+  if dpkg -l | awk '{print $2}' | grep -qx mosquitto-clients; then
+    warn "mosquitto-clients package still installed"
+    failed=true
+  fi
+
+  if ss -tln 2>/dev/null | grep -Eq '(:1883|:8883)\b'; then
+    warn "A listener still exists on 1883 or 8883"
+    failed=true
+  fi
+
+  if [[ -d /etc/mosquitto ]]; then
+    warn "/etc/mosquitto still exists"
+    failed=true
+  fi
+
+  if [[ "$failed" == true ]]; then
+    die "Uninstall verification failed."
+  fi
+}
+
+main() {
+  require_root
+  parse_args "$@"
+  confirm
+
+  stop_service
+  purge_packages
+  remove_paths
+  remove_user
+  post_check
+
+  echo "Uninstall complete."
+  echo "purge_packages=$PURGE_PACKAGES remove_user=$REMOVE_USER"
+}
+
+main "$@"
