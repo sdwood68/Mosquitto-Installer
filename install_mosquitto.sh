@@ -29,7 +29,6 @@ req MOSQ_LISTENER_PORT
 req MOSQ_BIND_ADDRESS
 req MOSQ_CONF_MAIN
 req MOSQ_CONF_DIR
-req MOSQ_CA_FILE
 req MOSQ_CERT_FILE
 req MOSQ_KEY_FILE
 req MOSQ_PASSWORD_FILE
@@ -58,18 +57,53 @@ LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 LETSENCRYPT_STAGING="${LETSENCRYPT_STAGING:-false}"
 LETSENCRYPT_FIX_DIR_PERMS="${LETSENCRYPT_FIX_DIR_PERMS:-true}"
 
-echo "[1/12] Installing packages..."
+verify_socket() {
+  local addr="$1"
+  local port="$2"
+  ss -H -lnt | awk '{print $4}' | grep -Eq "(^|.*)${addr}:${port}$"
+}
+
+verify_listener_bindings() {
+  echo "[12/13] Verifying listener bindings..."
+
+  if ! verify_socket "$MOSQ_BIND_ADDRESS" "$MOSQ_LISTENER_PORT"; then
+    echo "ERROR: Expected TLS listener on " \
+      "$MOSQ_BIND_ADDRESS:$MOSQ_LISTENER_PORT not found."
+    ss -lntp || true
+    exit 1
+  fi
+
+  if [[ "$OPEN_PLAINTEXT_1883" == "true" ]]; then
+    if ! verify_socket "$MOSQ_PLAINTEXT_BIND_ADDRESS" 1883; then
+      echo "ERROR: Expected plaintext listener on " \
+        "$MOSQ_PLAINTEXT_BIND_ADDRESS:1883 not found."
+      ss -lntp || true
+      exit 1
+    fi
+
+    if ss -H -lnt | awk '{print $4}' | grep -Eq \
+      '(^|.*)(0\.0\.0\.0|\[::\]|::):1883$'; then
+      echo "ERROR: Plaintext port 1883 is exposed on a non-local bind."
+      ss -lntp || true
+      exit 1
+    fi
+  fi
+
+  echo "Listener verification passed."
+}
+
+echo "[1/13] Installing packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y mosquitto mosquitto-clients ufw openssl certbot
 
-echo "[2/12] Creating directories..."
+echo "[2/13] Creating directories..."
 install -d -m 0755 "$MOSQ_CONF_DIR"
 install -d -m 0755 "$(dirname "$MOSQ_LOG_FILE")"
 install -d -m 0755 "$MOSQ_PERSISTENCE_LOCATION"
 chown -R mosquitto:mosquitto "$MOSQ_PERSISTENCE_LOCATION"
 
-echo "[3/12] Ensuring password file exists (mosquitto-owned, 0600)..."
+echo "[3/13] Ensuring password file exists (mosquitto-owned, 0600)..."
 install -m 0600 -o mosquitto -g mosquitto /dev/null "$MOSQ_PASSWORD_FILE"
 
 create_user() {
@@ -105,7 +139,7 @@ if [[ "${CREATE_MQTT_USER:-false}" == "true" ]]; then
   create_user "$MQTT_USERNAME" "${MQTT_PASSWORD:-}"
 fi
 
-echo "[4/12] Firewall (UFW)..."
+echo "[4/13] Firewall (UFW)..."
 if [[ "$UFW_ALLOW" == "true" ]]; then
   ufw allow OpenSSH >/dev/null || true
   if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
@@ -123,7 +157,7 @@ if [[ "$UFW_ALLOW" == "true" ]]; then
   ufw --force enable >/dev/null || true
 fi
 
-echo "[5/12] (Optional) Obtaining/refreshing Let's Encrypt cert..."
+echo "[5/13] (Optional) Obtaining/refreshing Let's Encrypt cert..."
 if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
   if [[ -z "$LETSENCRYPT_DOMAIN" || -z "$LETSENCRYPT_EMAIL" ]]; then
     echo "LETSENCRYPT_ENABLE=true but LETSENCRYPT_DOMAIN and/or" \
@@ -143,7 +177,7 @@ if [[ "$LETSENCRYPT_ENABLE" == "true" ]]; then
   certbot "${CB_ARGS[@]}" || true
 fi
 
-echo "[6/12] Fixing Let's Encrypt directory traversal permissions (if enabled)..."
+echo "[6/13] Fixing Let's Encrypt directory traversal permissions..."
 if [[ "$LETSENCRYPT_FIX_DIR_PERMS" == "true" ]]; then
   if [[ -d /etc/letsencrypt/live ]]; then
     chgrp mosquitto /etc/letsencrypt/live || true
@@ -165,7 +199,7 @@ if [[ "$LETSENCRYPT_FIX_DIR_PERMS" == "true" ]]; then
   fi
 fi
 
-echo "[7/12] Installing renewal deploy hook (fix perms + restart Mosquitto)..."
+echo "[7/13] Installing renewal deploy hook (fix perms + restart)..."
 HOOK_DIR="/etc/letsencrypt/renewal-hooks/deploy"
 HOOK_PATH="$HOOK_DIR/restart-mosquitto.sh"
 install -d -m 0755 "$HOOK_DIR"
@@ -186,12 +220,10 @@ systemctl restart mosquitto
 __HOOK__
 chmod 0755 "$HOOK_PATH"
 
-echo "[8/12] (Optional) Ensuring ACL file exists..."
+echo "[8/13] (Optional) Ensuring ACL file exists..."
 if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
   install -m 0600 -o mosquitto -g mosquitto /dev/null "$MOSQ_ACL_FILE"
 
-  # Write a commented template so "empty ACL" can't surprise you.
-  # If WRITE_DEFAULT_ACL=true and CREATE_MQTT_USER=true, also seed it.
   {
     echo "# Mosquitto ACL file"
     echo "# Format:"
@@ -207,12 +239,16 @@ if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
       echo "topic readwrite ${ACL_TOPIC_PREFIX}"
       echo
     else
-      echo "# Example"
+      echo "# Example publisher"
       echo "# user watergauge"
       echo "# topic readwrite watergauge/#"
       echo
-      echo "# NOTE: If MOSQ_ENABLE_ACL=true, you must add rules or" \
-        " clients will not be able to publish/subscribe."
+      echo "# Example local MQTTPlot subscriber"
+      echo "# user MQTTPlot"
+      echo "# topic read watergauge/#"
+      echo
+      echo "# NOTE: If MOSQ_ENABLE_ACL=true, add real rules or clients"
+      echo "# will connect successfully but be denied publish/subscribe."
       echo
     fi
   } > "$MOSQ_ACL_FILE"
@@ -221,7 +257,7 @@ if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
   chmod 0644 "$MOSQ_ACL_FILE"
 fi
 
-echo "[9/12] Writing Mosquitto configuration (atomic write)..."
+echo "[9/13] Writing Mosquitto configuration..."
 MAIN_TMP="$(mktemp)"
 cleanup() { rm -f "$MAIN_TMP"; }
 trap cleanup EXIT
@@ -236,7 +272,7 @@ else
   LOG_DEST_LINE="log_dest $MOSQ_LOG_DEST"
 fi
 
-cat > "$MAIN_TMP" <<EOF
+cat > "$MAIN_TMP" <<EOF2
 # Managed by install_mosquitto.sh
 
 # -------------------------------------------------------------------
@@ -247,13 +283,13 @@ allow_zero_length_clientid false
 # -------------------------------------------------------------------
 # Persistence
 # -------------------------------------------------------------------
-persistence true
-persistence_location /var/lib/mosquitto/
+persistence ${MOSQ_PERSISTENCE}
+persistence_location ${MOSQ_PERSISTENCE_LOCATION}
 
 # -------------------------------------------------------------------
 # Logging
 # -------------------------------------------------------------------
-log_dest file /var/log/mosquitto/mosquitto.log
+${LOG_DEST_LINE}
 log_type error
 log_type warning
 log_type notice
@@ -262,53 +298,17 @@ connection_messages true
 # -------------------------------------------------------------------
 # AuthN/AuthZ
 # -------------------------------------------------------------------
-allow_anonymous false
-password_file /etc/mosquitto/passwd
-acl_file /etc/mosquitto/aclfile
-
-# -------------------------------------------------------------------
-# Internet-facing TLS listener
-# -------------------------------------------------------------------
-listener 8883 0.0.0.0
-protocol mqtt
-
-certfile /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
-keyfile /etc/letsencrypt/live/${DOMAIN}/privkey.pem
-
-tls_version tlsv1.2
-require_certificate false
-
-# -------------------------------------------------------------------
-# Localhost plaintext listener (MQTTPlot)
-# -------------------------------------------------------------------
-listener 1883 127.0.0.1
-protocol mqtt
-
-pid_file /run/mosquitto/mosquitto.pid
-user mosquitto
-EOF
+allow_anonymous ${MOSQ_ALLOW_ANONYMOUS}
+password_file ${MOSQ_PASSWORD_FILE}
+EOF2
 
 if [[ "$MOSQ_ENABLE_ACL" == "true" ]]; then
-  cat >> "$MAIN_TMP" <<EOF
+  cat >> "$MAIN_TMP" <<EOF2
 acl_file ${MOSQ_ACL_FILE}
-EOF
+EOF2
 fi
 
-# IMPORTANT: Ubuntu 24.04 (mosquitto 2.0.18) can attempt to bind 1883 twice
-# when using an explicit "listener 1883 ..." stanza.
-# Use bind_address + port instead for the local-only plaintext listener.
-if [[ "$OPEN_PLAINTEXT_1883" == "true" ]]; then
-  cat >> "$MAIN_TMP" <<EOF
-
-# -------------------------------------------------------------------
-# Local-only plaintext listener (NOT internet-facing)
-# -------------------------------------------------------------------
-bind_address ${MOSQ_PLAINTEXT_BIND_ADDRESS}
-port 1883
-EOF
-fi
-
-cat >> "$MAIN_TMP" <<EOF
+cat >> "$MAIN_TMP" <<EOF2
 
 # -------------------------------------------------------------------
 # Internet-facing TLS listener
@@ -316,41 +316,60 @@ cat >> "$MAIN_TMP" <<EOF
 listener ${MOSQ_LISTENER_PORT} ${MOSQ_BIND_ADDRESS}
 protocol mqtt
 
-cafile ${MOSQ_CA_FILE}
 certfile ${MOSQ_CERT_FILE}
 keyfile ${MOSQ_KEY_FILE}
 
 tls_version tlsv1.2
-EOF
+EOF2
 
 if [[ "$REQUIRE_CLIENT_CERT" == "true" ]]; then
-  cat >> "$MAIN_TMP" <<'EOF'
+  if [[ -z "${MOSQ_CA_FILE:-}" ]]; then
+    echo "REQUIRE_CLIENT_CERT=true requires MOSQ_CA_FILE to be set."
+    exit 1
+  fi
+  cat >> "$MAIN_TMP" <<EOF2
+cafile ${MOSQ_CA_FILE}
 require_certificate true
 use_identity_as_username true
-EOF
+EOF2
 else
-  cat >> "$MAIN_TMP" <<'EOF'
+  cat >> "$MAIN_TMP" <<'EOF2'
 require_certificate false
-EOF
+EOF2
 fi
 
-cat >> "$MAIN_TMP" <<EOF
+if [[ "$OPEN_PLAINTEXT_1883" == "true" ]]; then
+  cat >> "$MAIN_TMP" <<EOF2
+
+# -------------------------------------------------------------------
+# Localhost plaintext listener (MQTTPlot)
+# -------------------------------------------------------------------
+listener 1883 ${MOSQ_PLAINTEXT_BIND_ADDRESS}
+protocol mqtt
+EOF2
+fi
+
+cat >> "$MAIN_TMP" <<'EOF2'
 
 pid_file /run/mosquitto/mosquitto.pid
 user mosquitto
-EOF
+EOF2
 
 install -m 0644 -o root -g root "$MAIN_TMP" "$MOSQ_CONF_MAIN"
 
-echo "[10/12] Enabling & restarting mosquitto..."
+echo "[10/13] Validating configuration syntax..."
+mosquitto -c "$MOSQ_CONF_MAIN" -t
+
+echo "[11/13] Enabling & restarting mosquitto..."
 systemctl enable mosquitto
 systemctl reset-failed mosquitto || true
 systemctl restart mosquitto
 
-echo "[11/12] Listening sockets:"
-ss -lntp | grep mosquitto || true
+verify_listener_bindings
 
-echo "[12/12] Summary:"
+echo "[13/13] Summary:"
 echo "Main config: $MOSQ_CONF_MAIN"
-echo "ACL file:    ${MOSQ_ACL_FILE}"
-echo "Renew hook:  $HOOK_PATH"
+echo "Password file: $MOSQ_PASSWORD_FILE"
+echo "ACL file:      ${MOSQ_ACL_FILE}"
+echo "Renew hook:    $HOOK_PATH"
+ss -lntp | grep mosquitto || true
